@@ -746,12 +746,7 @@ impl<'d> I2c<'d, Async> {
         let address = address.into();
 
         self.driver()
-            .write(address, write_buffer, true, read_buffer.is_empty())
-            .await
-            .inspect_err(|_| self.internal_recover())?;
-
-        self.driver()
-            .read(address, read_buffer, true, true, false)
+            .write_read(address, write_buffer, read_buffer, true, true, false)
             .await
             .inspect_err(|_| self.internal_recover())?;
 
@@ -805,7 +800,6 @@ impl<'d> I2c<'d, Async> {
         let mut op_iter = operations
             .filter(|op| op.is_write() || !op.is_empty())
             .peekable();
-
         while let Some(op) = op_iter.next() {
             let next_op = op_iter.peek().map(|v| v.kind());
             let kind = op.kind();
@@ -1679,15 +1673,14 @@ impl Driver<'_> {
         self.read_all_from_fifo_blocking(buffer)
     }
 
-    /// Configures the I2C peripheral for a write operation.
-    /// - `addr` is the address of the slave device.
-    /// - `bytes` is the data two be sent.
+    /// Appends commands to the command registers to set up for a write
+    /// transaction.
+    /// - `bytes` is the data to be sent.
     /// - `start` indicates whether the operation should start by a START
     ///   condition and sending the address.
-    /// - `cmd_iterator` is an iterator over the command registers.
-    fn setup_write<'a, I>(
+    /// - `cmd_iterator` is an iterator over the remaining command registers.
+    fn add_write_cmds<'a, I>(
         &self,
-        addr: I2cAddress,
         bytes: &[u8],
         start: bool,
         cmd_iterator: &mut I,
@@ -1776,9 +1769,27 @@ impl Driver<'_> {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Configures the I2C peripheral for a write operation.
+    /// - `addr` is the address of the slave device.
+    /// - `bytes` is the data two be sent.
+    /// - `start` indicates whether the operation should start by a START
+    ///   condition and sending the address.
+    /// - `cmd_iterator` is an iterator over the command registers.
+    fn setup_write<'a, I>(
+        &self,
+        addr: I2cAddress,
+        bytes: &[u8],
+        start: bool,
+        cmd_iterator: &mut I,
+    ) -> Result<(), Error>
+    where
+        I: Iterator<Item = &'a COMD>,
+    {
+        self.add_write_cmds(bytes, start, cmd_iterator)?;
         self.update_config();
-
         if start {
             // Load address and R/W bit into FIFO
             match addr {
@@ -1794,17 +1805,16 @@ impl Driver<'_> {
         Ok(())
     }
 
-    /// Configures the I2C peripheral for a read operation.
-    /// - `addr` is the address of the slave device.
+    /// Appends commands to the command registers to set up for a read
+    /// transaction.
     /// - `buffer` is the buffer to store the read data.
     /// - `start` indicates whether the operation should start by a START
     ///   condition and sending the address.
     /// - `will_continue` indicates whether there is another read operation
     ///   following this one and we should not nack the last byte.
-    /// - `cmd_iterator` is an iterator over the command registers.
-    fn setup_read<'a, I>(
+    /// - `cmd_iterator` is an iterator over the remaining command registers.
+    fn add_read_cmds<'a, I>(
         &self,
-        addr: I2cAddress,
         buffer: &mut [u8],
         start: bool,
         will_continue: bool,
@@ -1910,15 +1920,81 @@ impl Driver<'_> {
                 },
             )?;
         }
+        Ok(())
+    }
 
+    /// Configures the I2C peripheral for a read operation.
+    /// - `addr` is the address of the slave device.
+    /// - `buffer` is the buffer to store the read data.
+    /// - `start` indicates whether the operation should start by a START
+    ///   condition and sending the address.
+    /// - `will_continue` indicates whether there is another read operation
+    ///   following this one and we should not nack the last byte.
+    /// - `cmd_iterator` is an iterator over the command registers.
+    fn setup_read<'a, I>(
+        &self,
+        addr: I2cAddress,
+        buffer: &mut [u8],
+        start: bool,
+        will_continue: bool,
+        cmd_iterator: &mut I,
+    ) -> Result<(), Error>
+    where
+        I: Iterator<Item = &'a COMD>,
+    {
+        self.add_read_cmds(buffer, start, will_continue, cmd_iterator)?;
         self.update_config();
-
         if start {
             // Load address and R/W bit into FIFO
             match addr {
                 I2cAddress::SevenBit(addr) => {
                     write_fifo(self.regs(), (addr << 1) | OperationType::Read as u8);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Configures the I2C peripheral for a hardware-driven write-read
+    /// operation.
+    /// - `addr` is the address of the slave device.
+    /// - `write_buf` is the buffer containing the bytes to send.
+    /// - `read_buf` is the buffer to store the read data.
+    /// - `start` indicates whether the write operation should start by a START
+    ///   condition and sending the address.
+    /// - `read_will_continue` indicates whether there is another read operation
+    ///   following this one and we should not nack the last byte.
+    /// - `cmd_iterator` is an iterator over the command registers.
+    fn setup_write_read<'a, I>(
+        &self,
+        addr: I2cAddress,
+        write_buf: &[u8],
+        read_buf: &mut [u8],
+        start: bool,
+        read_will_continue: bool,
+        cmd_iterator: &mut I,
+    ) -> Result<(), Error>
+    where
+        I: Iterator<Item = &'a COMD>,
+    {
+        self.add_write_cmds(write_buf, start, cmd_iterator)?;
+        // We must start again between the write and read operations.
+        add_cmd(cmd_iterator, Command::Start)?;
+        self.add_read_cmds(read_buf, true, read_will_continue, cmd_iterator)?;
+        self.update_config();
+        if start {
+            match addr {
+                I2cAddress::SevenBit(addr) => {
+                    write_fifo(self.regs(), (addr << 1) | OperationType::Write as u8);
+                }
+            }
+        }
+        for b in write_buf {
+            write_fifo(self.regs(), *b);
+        }
+        match addr {
+            I2cAddress::SevenBit(addr) => {
+                write_fifo(self.regs(), (addr << 1) | OperationType::Read as u8);
             }
         }
         Ok(())
@@ -2266,6 +2342,44 @@ impl Driver<'_> {
         Ok(())
     }
 
+    /// Executes an I2C write-read operation.
+    /// - `addr` is the address of the slave device.
+    /// - `write_buf` is the buffer containing the bytes to send.
+    /// - `read_buf` is the buffer to store the read data.
+    /// - `start` indicates whether the write operation should start by a START
+    ///   condition and sending the address.
+    /// - `read_will_continue` indicates whether there is another read operation
+    ///   following this one and we should not nack the last byte.
+    /// - `cmd_iterator` is an iterator over the command registers.
+    fn start_write_read_operation(
+        &self,
+        address: I2cAddress,
+        write_buf: &[u8],
+        read_buf: &mut [u8],
+        start: bool,
+        read_will_continue: bool,
+    ) -> Result<(), Error> {
+        self.reset_fifo();
+        self.reset_command_list();
+
+        let cmd_iterator = &mut self.regs().comd_iter();
+
+        if start {
+            add_cmd(cmd_iterator, Command::Start)?;
+        }
+        self.setup_write_read(
+            address,
+            write_buf,
+            read_buf,
+            start,
+            read_will_continue,
+            cmd_iterator,
+        )?;
+        add_cmd(cmd_iterator, Command::End)?;
+        self.start_transmission();
+        Ok(())
+    }
+
     /// Executes an I2C write operation.
     /// - `addr` is the address of the slave device.
     /// - `bytes` is the data two be sent.
@@ -2425,6 +2539,35 @@ impl Driver<'_> {
         Ok(())
     }
 
+    /// Executes an async I2C write-read operation.
+    /// - `addr` is the address of the slave device.
+    /// - `write_buf` is the buffer containing the bytes to send.
+    /// - `read_buf` is the buffer to store the read data.
+    /// - `start` indicates whether the write operation should start by a START
+    ///   condition and sending the address.
+    /// - `read_will_continue` indicates whether there is another read operation
+    ///   following this one and we should not nack the last byte.
+    /// - `cmd_iterator` is an iterator over the command registers.
+    async fn write_read_operation(
+        &self,
+        addr: I2cAddress,
+        write_buf: &[u8],
+        read_buf: &mut [u8],
+        start: bool,
+        stop: bool,
+        read_will_continue: bool,
+    ) -> Result<(), Error> {
+        self.clear_all_interrupts();
+        self.start_write_read_operation(addr, write_buf, read_buf, start, read_will_continue)?;
+        self.read_all_from_fifo(read_buf).await?;
+        self.wait_for_completion(true).await?;
+
+        if stop {
+            self.stop_operation().await?;
+        }
+        Ok(())
+    }
+
     /// Perform a single STOP
     async fn stop_operation(&self) -> Result<(), Error> {
         let cmd_iterator = &mut self.regs().comd_iter();
@@ -2537,6 +2680,62 @@ impl Driver<'_> {
             .await?;
         }
 
+        Ok(())
+    }
+
+    async fn write_read(
+        &self,
+        addr: I2cAddress,
+        write_buf: &[u8],
+        read_buf: &mut [u8],
+        start: bool,
+        stop: bool,
+        will_continue: bool,
+    ) -> Result<(), Error> {
+        if write_buf.is_empty() {
+            self.write_operation(addr, &[], start, false).await?;
+            return self.read(addr, read_buf, true, stop, will_continue).await;
+        }
+
+        let write_chunk_count = VariableChunkIter::new(write_buf).count();
+        let mut last_write_idx = 0;
+        let mut last_write_chunk = [].as_slice();
+        for (idx, chunk) in VariableChunkIter::new(write_buf).enumerate() {
+            if idx != write_chunk_count - 1 {
+                self.write_operation(addr, chunk, start && idx == 0, false)
+                    .await?;
+            } else {
+                last_write_idx = idx;
+                last_write_chunk = chunk;
+            }
+        }
+
+        let read_chunk_count = VariableChunkIterMut::new(read_buf).count();
+        let mut read_chunks_iter = VariableChunkIterMut::new(read_buf).enumerate();
+        let Some((_, first_read_chunk)) = read_chunks_iter.next() else {
+            return self
+                .write_operation(addr, last_write_chunk, start && last_write_idx == 0, stop)
+                .await;
+        };
+        self.write_read_operation(
+            addr,
+            last_write_chunk,
+            first_read_chunk,
+            start && last_write_idx == 0,
+            stop && read_chunk_count == 1,
+            will_continue || read_chunk_count > 1,
+        )
+        .await?;
+        for (idx, chunk) in read_chunks_iter {
+            self.read_operation(
+                addr,
+                chunk,
+                false,
+                stop && idx == read_chunk_count - 1,
+                will_continue || idx < read_chunk_count - 1,
+            )
+            .await?;
+        }
         Ok(())
     }
 }

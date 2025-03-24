@@ -30,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ESP32-C6/H2: The `flip_link` feature should no longer crash (#3203)
 - SPI: `Spi::transfer_in_place_async` now stops the transfer when cancelled (#3242)
 - ESP32/ESP32-S2: Avoid running into timeouts with reads/writes larger than the FIFO (#3199)
-
 - ESP32-C6: Keep ADC enabled to improve radio signal strength (#3249)
+- Small I2c `write_read` operations are hardware driven to improve async reliability (#3291)
 
 ### Removed
 
